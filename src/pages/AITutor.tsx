@@ -4,6 +4,7 @@ import { geminiService } from '../services/gemini';
 import { storage } from '../services/storage';
 import { ChatMessage, SubjectCategory, StudyMode, ALL_SUBJECTS } from '../types';
 import { MarkdownRenderer } from '../components/MarkdownRenderer';
+import { Modal } from '../components/Modal';
 import {
   Send,
   RotateCcw,
@@ -35,6 +36,7 @@ export const AITutor: React.FC = () => {
   const [studyMode, setStudyMode] = useState<StudyMode>('standard');
   const [isLoading, setIsLoading] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [isClearModalOpen, setIsClearModalOpen] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -211,11 +213,14 @@ export const AITutor: React.FC = () => {
   };
 
   const handleClearChat = () => {
-    if (window.confirm('Are you sure you want to clear this conversation?')) {
-      setMessages([]);
-      storage.saveChatMessages([]);
-      addToast('Conversation Reset', 'Academic session history cleared.', 'info');
-    }
+    setIsClearModalOpen(true);
+  };
+
+  const confirmClearChat = () => {
+    setIsClearModalOpen(false);
+    setMessages([]);
+    storage.saveChatMessages([]);
+    addToast('Conversation Reset', 'Academic session history cleared.', 'info');
   };
 
   // Curated subject-specific academic starters
@@ -531,6 +536,35 @@ export const AITutor: React.FC = () => {
           </span>
         </div>
       </div>
+
+      <Modal
+        isOpen={isClearModalOpen}
+        onClose={() => setIsClearModalOpen(false)}
+        title="Clear Conversation History"
+        maxWidth="sm"
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setIsClearModalOpen(false)}
+              className="px-4 py-2 rounded-xl text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={confirmClearChat}
+              className="px-4 py-2 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 transition-colors cursor-pointer"
+            >
+              Clear History
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          Are you sure you want to reset this chat session? All current questions and academic tutor responses in this view will be cleared.
+        </p>
+      </Modal>
     </div>
   );
 };

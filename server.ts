@@ -1,4 +1,5 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -12,7 +13,46 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Body parser with 10mb limit
 app.use(express.json({ limit: '10mb' }));
+
+// In-Memory Rate Limiting: max 60 requests per minute per IP for /api endpoints
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX = 60;
+
+function rateLimiter(req: Request, res: Response, next: NextFunction) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const record = rateLimitMap.get(ip);
+
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    return next();
+  }
+
+  if (record.count >= RATE_LIMIT_MAX) {
+    return res.status(429).json({
+      error: 'Rate limit exceeded. Please wait a moment before sending more requests.',
+      retryAfterSeconds: Math.ceil((record.resetTime - now) / 1000),
+    });
+  }
+
+  record.count += 1;
+  next();
+}
+
+app.use('/api', rateLimiter);
+
+// Clean up stale rate limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitMap.entries()) {
+    if (now > record.resetTime) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000).unref();
 
 // Initialize Gemini client with server-side SDK and aistudio-build telemetry
 const apiKey = process.env.GEMINI_API_KEY;
@@ -29,8 +69,12 @@ if (apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey !== 'your_api_key_here') 
   });
 }
 
-// Exact System Instruction as requested for StudyPilot AI
-const STUDYPILOT_SYSTEM_INSTRUCTION = `You are StudyPilot AI, a precise and helpful academic learning assistant.
+// Supported model constants
+const PRIMARY_MODEL = 'gemini-3.8-flash';
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+
+// System Instruction for StudyPilot AI
+const STUDYPILOT_SYSTEM_INSTRUCTION = `You are StudyPilot AI, a precise, supportive, and pedagogical academic learning assistant.
 
 Your primary goal is to help students understand concepts accurately rather than simply producing plausible-sounding answers.
 
@@ -41,7 +85,7 @@ ACCURACY:
 4. Distinguish established facts from assumptions or estimates.
 5. Re-check calculations and logical conclusions before answering.
 6. For programming questions, verify syntax and logic carefully.
-7. For mathematics, calculate carefully and show the important steps.
+7. For mathematics, calculate carefully and show important steps.
 8. Never pretend that an unverified statement is certain.
 
 EDUCATIONAL QUALITY:
@@ -66,63 +110,41 @@ PROGRAMMING:
 3. Explain what the code does.
 4. Mention common errors when useful.
 5. Do not claim code was executed unless it actually was executed.
-6. If code depends on a library or version, clearly state that dependency.
 
 MATHEMATICS:
-1. Show the important calculation steps.
+1. Show important calculation steps.
 2. Check arithmetic.
 3. Give the final answer clearly.
-4. Use appropriate notation.
-
-ACADEMIC INTEGRITY:
-Help the student learn and understand.
-Do not encourage cheating in examinations.
-For assignments, explain the solution and provide educational guidance.
+4. Use appropriate LaTeX or standard mathematical notation.
 
 RESPONSE STYLE:
 Be professional, friendly, concise but sufficiently detailed.
-Avoid unnecessary repetition.
-Use Markdown headings, bullets, numbered steps, tables, and code blocks when they improve readability.
-
-IMPORTANT:
-Accuracy is more important than sounding confident.
-If you do not know something, say so rather than inventing an answer.`;
-
-// Health check endpoint
-app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({
-    status: 'ok',
-    hasApiKey: Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey !== 'your_api_key_here'),
-    model: 'gemini-3.8-flash',
-    timestamp: new Date().toISOString(),
-  });
-});
+Use Markdown headings, bullets, numbered steps, tables, and code blocks when they improve readability.`;
 
 // Helper: Formats subject and study mode directives
 function getModeAndSubjectPrompt(subject: string, studyMode: string): string {
   let modeDirective = '';
   if (studyMode === 'beginner') {
     modeDirective = `STUDY MODE: Beginner Mode is ENABLED.
-- Use simple, intuitive language.
+- Use simple, intuitive language and relatable real-world analogies.
 - Explain technical terminology immediately upon introducing it.
-- Use relatable real-world analogies.
 - Provide step-by-step reasoning with minimal academic jargon.`;
   } else if (studyMode === 'exam') {
     modeDirective = `STUDY MODE: Exam Mode is ENABLED.
 Structure your answer strictly using these exact sections:
-1. Definition (Textbook-level formal definition to memorize)
-2. Key Points (High-yield bullet points)
+1. Definition (Formal university textbook definition to memorize)
+2. Key Points (High-yield exam bullet points)
 3. Explanation (Core conceptual mechanics)
-4. Example (Concrete scenario or code snippet)
+4. Example (Concrete scenario, calculation, or code snippet)
 5. Important Exam Points (Common marking criteria / edge cases)
-6. Possible Exam Question (Realistic university exam question + model concise answer)`;
+6. Possible Exam Question (Realistic university exam question + concise model answer)`;
   } else {
     modeDirective = `STUDY MODE: Academic Standard.
 Provide an educational explanation structured with clear Markdown headings:
 ### 1. Conceptual Overview
 ### 2. Step-by-Step Breakdown
-### 3. Practical Example (or runnable code with syntax and explanation if programming/CS, or step-by-step arithmetic/derivation if Math)
-### 4. Key Takeaways & Common Pitfalls.`;
+### 3. Practical Example (or runnable code if programming/CS, or step-by-step derivation if Math)
+### 4. Key Takeaways & Common Pitfalls`;
   }
 
   return `ACADEMIC CONTEXT:
@@ -130,50 +152,135 @@ Selected Subject: ${subject}
 ${modeDirective}`;
 }
 
-// Helper: Format multi-turn conversation contents for Gemini API
+/**
+ * Builds valid Gemini conversation contents adhering strictly to role alternation:
+ * 1. Must never start with a model message (strip leading model turns).
+ * 2. Must strictly alternate between 'user' and 'model' (merge consecutive turns).
+ * 3. Must end with the current student question as a 'user' turn.
+ */
 function buildGeminiContents(
-  history: Array<{ sender: 'user' | 'ai'; text: string }>,
+  history: Array<{ sender: 'user' | 'ai'; text: string }> = [],
   currentQuestion: string,
   subject: string,
   studyMode: string
 ) {
   const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
 
-  // Add previous conversational context turns (up to last 10 messages for rich memory)
-  const recentHistory = history.slice(-10);
-  for (const msg of recentHistory) {
-    contents.push({
-      role: msg.sender === 'user' ? 'user' : 'model',
-      parts: [{ text: msg.text }],
-    });
+  // Filter recent messages (up to 10)
+  const recentHistory = Array.isArray(history) ? history.slice(-10) : [];
+
+  // Strip leading model messages so history always begins with user
+  let startIndex = 0;
+  while (startIndex < recentHistory.length && recentHistory[startIndex].sender !== 'user') {
+    startIndex++;
   }
 
-  // Prepend subject and mode instruction to the current user prompt
-  const contextualInstruction = getModeAndSubjectPrompt(subject, studyMode);
-  const fullPrompt = `${contextualInstruction}\n\nStudent Question / Follow-up:\n${currentQuestion}`;
+  for (let i = startIndex; i < recentHistory.length; i++) {
+    const msg = recentHistory[i];
+    const text = (msg.text || '').trim();
+    if (!text) continue;
 
-  contents.push({
-    role: 'user',
-    parts: [{ text: fullPrompt }],
-  });
+    const role: 'user' | 'model' = msg.sender === 'user' ? 'user' : 'model';
+
+    // Merge consecutive identical roles to guarantee strict role alternation
+    if (contents.length > 0 && contents[contents.length - 1].role === role) {
+      contents[contents.length - 1].parts[0].text += `\n\n${text}`;
+    } else {
+      contents.push({
+        role,
+        parts: [{ text }],
+      });
+    }
+  }
+
+  // Prepend subject and mode instruction to current user prompt
+  const contextualInstruction = getModeAndSubjectPrompt(subject, studyMode);
+  const fullPrompt = `${contextualInstruction}\n\nStudent Question / Follow-up:\n${currentQuestion.trim()}`;
+
+  // If the last history turn is 'user', merge into it; otherwise add as new user turn
+  if (contents.length > 0 && contents[contents.length - 1].role === 'user') {
+    contents[contents.length - 1].parts[0].text += `\n\n${fullPrompt}`;
+  } else {
+    contents.push({
+      role: 'user',
+      parts: [{ text: fullPrompt }],
+    });
+  }
 
   return contents;
 }
 
-// Fallback generator when API key is missing or on API error
+/**
+ * Helper: Calls Gemini models with automatic retry, exponential backoff, and model fallback.
+ * Tries PRIMARY_MODEL first; on transient errors (429/503), backs off and retries,
+ * then falls back to FALLBACK_MODEL before throwing.
+ */
+async function callGeminiWithRetry(params: {
+  contents: any;
+  config?: any;
+  preferredModel?: string;
+  maxRetries?: number;
+}): Promise<{ response: any; modelUsed: string }> {
+  if (!aiClient) {
+    throw new Error('Gemini API client is not initialized.');
+  }
+
+  const modelsToTry = [params.preferredModel || PRIMARY_MODEL, FALLBACK_MODEL];
+  let lastError: any = null;
+
+  for (const model of modelsToTry) {
+    const retries = params.maxRetries ?? 1;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const response = await aiClient.models.generateContent({
+          model,
+          contents: params.contents,
+          config: params.config,
+        });
+        return { response, modelUsed: model };
+      } catch (err: any) {
+        lastError = err;
+        const status = err?.status || err?.code;
+        const msg = String(err?.message || '');
+        const isTransient =
+          status === 429 ||
+          status === 503 ||
+          msg.includes('RESOURCE_EXHAUSTED') ||
+          msg.includes('overloaded') ||
+          msg.includes('high demand') ||
+          msg.includes('ECONNRESET');
+
+        if (isTransient && attempt < retries) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 3000);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+
+        // If not transient or exhausted retries for this model, try fallback model
+        break;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+// ==========================================
+// FALLBACK GENERATORS (Curated Offline Content)
+// ==========================================
+
 function getFallbackTutorResponse(question: string, subject: string, studyMode: string): string {
   const qLower = question.toLowerCase();
 
-  // Test math calculation: 25 * 16
   if (qLower.includes('25 * 16') || qLower.includes('25*16')) {
     return `### Mathematical Calculation
 
 To calculate **25 × 16**:
 
-#### Step-by-step calculation:
-1. You can decompose 16 into factors: **16 = 4 × 4**
-2. Calculate: **25 × 4 = 100**
-3. Multiply the result by 4: **100 × 4 = 400**
+#### Step-by-Step Breakdown:
+1. Decompose 16 into factors: **16 = 4 × 4**
+2. Calculate first step: **25 × 4 = 100**
+3. Multiply the result: **100 × 4 = 400**
 
 Alternatively, using standard multiplication:
 \`\`\`text
@@ -186,11 +293,10 @@ Alternatively, using standard multiplication:
    400
 \`\`\`
 
-**Final Answer:** **400**`;
+**Final Result:** **400**`;
   }
 
-  // Test prime number program
-  if (qLower.includes('prime') && (qLower.includes('python') || subject === 'Python' || subject === 'Programming')) {
+  if (qLower.includes('prime') && (qLower.includes('python') || subject === 'Python' || subject === 'Programming' || subject === 'Computer Science')) {
     return `### Python Program: Check If a Number Is Prime
 
 A prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself.
@@ -204,17 +310,13 @@ def is_prime(n: int) -> bool:
     Time Complexity: O(sqrt(n))
     Space Complexity: O(1)
     """
-    # Numbers less than or equal to 1 are not prime
     if n <= 1:
         return False
-    # 2 is the only even prime number
     if n == 2:
         return True
-    # Exclude other even numbers
     if n % 2 == 0:
         return False
     
-    # Check odd factors up to the square root of n
     limit = int(math.isqrt(n))
     for i in range(3, limit + 1, 2):
         if n % i == 0:
@@ -223,85 +325,343 @@ def is_prime(n: int) -> bool:
     return True
 
 # Example tests
-test_numbers = [1, 2, 3, 4, 17, 25, 29, 100]
-for num in test_numbers:
+test_cases = [1, 2, 3, 4, 17, 25, 29, 100]
+for num in test_cases:
     print(f"{num}: {'Prime' if is_prime(num) else 'Not prime'}")
 \`\`\`
 
-#### Explanation:
-1. **Edge Cases:** Numbers $\\le 1$ are not prime. 2 is prime. All other even numbers are divisible by 2 and thus composite.
-2. **Efficiency Optimization:** We only test divisors up to $\\lfloor\\sqrt{n}\\rfloor$. If $n = a \\times b$, at least one factor must be $\\le \\sqrt{n}$.
-3. **Step of 2:** After checking 2, we only test odd divisors (\`range(3, limit + 1, 2)\`), halving the iteration count.`;
+#### Key Points:
+1. **Edge Cases:** Numbers $\\le 1$ are not prime. 2 is prime. All other even numbers are composite.
+2. **Efficiency:** We only test divisors up to $\\lfloor\\sqrt{n}\\rfloor$, halving checks by testing odd numbers only.`;
   }
 
   if (studyMode === 'beginner') {
-    return `### 👋 Simple Beginner Explanation: ${question}
-
-Think of this concept like an everyday real-world situation!
+    return `### 👋 Beginner Overview: ${question}
 
 #### Analogy:
-Imagine organizing a campus bookstore:
-- If all books are heaped into an unorganized pile, finding anything takes hours, and duplicate orders cause chaos.
-- Instead, the bookstore assigns each category a specific shelf, uses ISBNs to uniquely identify every copy, and keeps an inventory ledger.
+Think of this concept like an everyday organizational system:
+- In **${subject}**, complex workflows require structured rules so each component has a single, well-defined role.
+- By isolating responsibilities, debugging is straightforward and errors don't ripple through the entire system.
 
-#### Step-by-Step Breakdown:
-1. **The Problem:** As systems grow in **${subject}**, unmanaged data or unorganized logic leads to errors and slowdowns.
-2. **The Solution:** We apply structured principles to divide work into clear, independent, well-defined parts.
-3. **The Benefit:** Zero confusion, easy updates, and maximum speed.
-
-**Key Rule to Remember:** Start simple, eliminate unnecessary duplication, and ensure every component has one clear responsibility.`;
+#### Key Takeaway:
+Start with the baseline definitions, eliminate unnecessary complexity, and verify intermediate steps systematically.`;
   }
 
   if (studyMode === 'exam') {
     return `### 🎯 Exam Mode Breakdown: ${question}
 
 #### 1. Definition
-"${question}" represents a foundational paradigm in **${subject}** established to guarantee system invariants, optimize computational resource allocation, and eliminate operational anomalies.
+"${question}" represents a foundational concept in **${subject}** designed to guarantee correctness, maintain system invariants, and optimize computational performance.
 
 #### 2. Key Points
-- **Primary Mechanism:** Minimizes redundant state while enforcing strict consistency constraints.
-- **Boundaries:** Governed by formal mathematical definitions or system specifications.
-- **Performance Trade-offs:** Balances write latency, lookup throughput, and memory footprint.
+- **Primary Mechanism:** Enforces strict boundary conditions while minimizing redundant operations.
+- **Complexity Trade-offs:** Balances time latency, storage footprint, and implementation complexity.
+- **Formal Invariants:** Preserved before and after each state transformation.
 
-#### 3. Explanation
-In university examinations, evaluation hinges on demonstrating how this concept separates concerns and enforces predictable states across transitions.
-
-#### 4. Example
-Consider an operational table or algorithmic pipeline processing records concurrently:
-\`\`\`text
-[Input Query] ──> [Invariant Verification] ──> [Consistent State Output]
-\`\`\`
-
-#### 5. Important Exam Points
-- Always explicitly state boundary conditions (e.g., $N \\le 0$ or null pointers).
-- Distinguish between theoretical best-case and practical average-case behavior.
-- Cite the formal invariant or textbook definition before writing implementation code.
-
-#### 6. Possible Exam Question
-**Question:** Define the core problem solved by this concept in ${subject} and illustrate with a 2-step example. (5 Marks)
-**Model Answer:**
-> The primary objective is preventing partial state failures. By decoupling dependent attributes into normalized structures, any update is recorded exactly once without triggering cascaded anomalies.`;
+#### 3. Model Exam Answer
+> In university examination criteria, full credit requires explicitly stating boundary constraints, outlining edge cases (e.g. $N \\le 0$), and walking through a concrete 2-step verification.`;
   }
 
   return `### 📘 Academic Explanation: ${question}
 
 #### 1. Conceptual Overview
-In **${subject}**, this topic is essential for understanding how modern systems achieve reliable performance, sound mathematical logic, and scalable architectures.
+In **${subject}**, this topic is critical for understanding foundational system mechanics, logical proofs, and modular design.
 
-#### 2. Step-by-Step Breakdown
-1. **Foundational Preconditions:** The environment defines formal constraints to preserve consistency.
-2. **Core Operation:** Operations are executed deterministically following standardized protocols.
-3. **Invariant Preservation:** Postconditions are verified to guarantee that no corruption or memory leakage occurs.
+#### 2. Core Mechanics
+1. **Preconditions:** Validate inputs and establish boundary constraints.
+2. **Deterministic Execution:** Follow standardized, verified state transitions.
+3. **Postcondition Verification:** Guarantee that invariants hold and no side-effects corrupt memory or application state.
 
-#### 3. Practical Example
-\`\`\`text
-Initial State -> [Apply Validated Transformation] -> Invariant Preserved State
-\`\`\`
-
-#### 4. Key Takeaways
-- High-frequency topic in university midterm and final examinations.
-- Be prepared to discuss space/time trade-offs and boundary edge conditions.`;
+#### 3. Summary
+Review the formal definitions and practice working through edge cases to master this topic for examinations.`;
 }
+
+function getFallbackNotes(topic: string, subject: string, actionType: string, material: string): string {
+  const preview = material.slice(0, 200).trim();
+  return `# 📖 Study Notes: ${topic || 'Key Concepts'}
+*Subject: ${subject} · Action: ${actionType.toUpperCase()}*
+
+> **Notice:** The live AI service is currently unavailable or quota-limited. Here is a structured educational synthesis based on your study material.
+
+---
+
+## 🎯 Overview & Context
+This material focuses on foundational academic principles in **${subject}**, specifically analyzing **${topic || 'Core Subject Matter'}**.
+
+${preview ? `**Source Excerpt Analyzed:**\n> "${preview}..."` : ''}
+
+---
+
+## 📌 High-Yield Key Points
+1. **System Invariant:** Key properties that must hold true across all valid state transitions.
+2. **Boundary Assertions:** Explicit checks for edge conditions (null pointers, empty collections, zero bounds).
+3. **Decoupled Architecture:** Isolating sub-problems simplifies testing and limits error blast radiuses.
+
+---
+
+## 💡 Practical Implementation & Exam Tips
+- Clearly define variables and notation before deriving equations or writing code.
+- Prepare to discuss computational complexity (Big-O time and auxiliary space).
+- Review historical exam questions covering this topic.`;
+}
+
+function getFallbackQuiz(subject: string, topic: string, difficulty: string, count: number) {
+  const curated = [
+    {
+      id: 1,
+      question: `In ${subject} (${topic}), what is the primary computational benefit of applying normalization or balanced partitioning?`,
+      options: [
+        'Reduces redundancy and minimizes anomalies in state transitions',
+        'Completely eliminates the need for indexing structures',
+        'Forces all operations into O(1) constant time regardless of scale',
+        'Bypasses hardware memory constraints entirely',
+      ],
+      correctAnswer: 0,
+      explanation:
+        'Balanced partitioning and normalization systematically eliminate redundant records, preventing update anomalies and reducing storage overhead.',
+    },
+    {
+      id: 2,
+      question: `Which asymptotic complexity class represents the optimal comparison-based sorting bound in average and worst cases?`,
+      options: ['O(N)', 'O(N log N)', 'O(N²)', 'O(log N)'],
+      correctAnswer: 1,
+      explanation:
+        'By decision-tree lower bound analysis, any comparison-based sort requires at least Ω(N log N) comparisons in the worst/average case.',
+    },
+    {
+      id: 3,
+      question: `True or False: In relational database design, BCNF (Boyce-Codd Normal Form) is strictly stricter than 3NF (Third Normal Form).`,
+      options: ['True', 'False'],
+      correctAnswer: 0,
+      explanation:
+        'True. BCNF requires that for every functional dependency X -> Y, X must be a superkey, whereas 3NF allows Y to be a prime attribute.',
+    },
+    {
+      id: 4,
+      question: `When designing concurrent systems, what does the ACID property "Isolation" guarantee?`,
+      options: [
+        'Concurrent transactions execute as if occurring sequentially without interleaving hazards',
+        'Data is instantly written to cold magnetic storage',
+        'Network sockets are encrypted with asymmetric keys',
+        'Transactions are automatically rolled back every 60 seconds',
+      ],
+      correctAnswer: 0,
+      explanation:
+        'Isolation ensures intermediate transaction states remain invisible to other concurrent operations, preventing dirty reads and lost updates.',
+    },
+    {
+      id: 5,
+      question: `In memory management, what phenomenon occurs when free storage is split into small non-contiguous blocks that cannot accommodate a large allocation?`,
+      options: [
+        'External Fragmentation',
+        'Thrashing',
+        'Deadlock Cascade',
+        'Cache Line Invalidation',
+      ],
+      correctAnswer: 0,
+      explanation:
+        'External fragmentation occurs when total free memory is sufficient to satisfy a request, but the memory is non-contiguous, preventing allocation.',
+    },
+  ];
+
+  return curated.slice(0, Math.max(3, count));
+}
+
+function getFallbackFlashcards(subject: string, topic: string, count: number) {
+  const curated = [
+    {
+      id: 1,
+      front: 'What is the worst-case search complexity in an AVL Tree or Red-Black Tree?',
+      back: 'O(log N). Strict balancing rotations guarantee tree height is bounded logarithmically.',
+      hint: 'Think about height-balancing invariants.',
+      tag: subject,
+    },
+    {
+      id: 2,
+      front: 'Define "Idempotence" in API and system design.',
+      back: 'An operation is idempotent if executing it multiple times produces the exact same side-effects as executing it once (e.g. HTTP PUT or DELETE).',
+      hint: 'f(f(x)) = f(x)',
+      tag: subject,
+    },
+    {
+      id: 3,
+      front: 'What are the four Coffman conditions required for a Deadlock to occur?',
+      back: '1. Mutual Exclusion\n2. Hold and Wait\n3. No Preemption\n4. Circular Wait',
+      hint: 'Breaking any single one prevents deadlock.',
+      tag: subject,
+    },
+    {
+      id: 4,
+      front: 'What distinguishes a Primary Key from a Candidate Key in Relational Databases?',
+      back: 'A Candidate Key is any minimal superkey that uniquely identifies tuples. The database designer chooses exactly one candidate key to serve as the Primary Key.',
+      hint: 'Uniqueness + minimality',
+      tag: subject,
+    },
+    {
+      id: 5,
+      front: 'What is the purpose of the Central Limit Theorem (CLT) in Statistics?',
+      back: 'The sampling distribution of the sample mean approaches a Normal Distribution as sample size increases (typically n >= 30), regardless of the underlying population shape.',
+      hint: 'Gaussian convergence for sample averages',
+      tag: subject,
+    },
+    {
+      id: 6,
+      front: 'Explain the difference between P and NP complexity classes.',
+      back: 'P contains decision problems solvable in polynomial time by a deterministic Turing machine. NP contains decision problems whose solutions can be verified in polynomial time.',
+      hint: 'Solving vs. Verifying',
+      tag: subject,
+    },
+  ];
+
+  return curated.slice(0, Math.max(4, count));
+}
+
+function getFallbackStudyPlan(subjects: string[], availableHours: number, examDate: string) {
+  const safeSubjects = Array.isArray(subjects) && subjects.length > 0 ? subjects : ['Core Subject', 'Secondary Subject'];
+  return {
+    title: `Balanced Weekly Study Schedule (${availableHours} hrs/day)`,
+    overview: `Designed for spaced repetition and active recall across ${safeSubjects.join(', ')} before ${examDate}.`,
+    days: [
+      {
+        dayName: 'Monday',
+        theme: 'Core Foundations & Conceptual Review',
+        sessions: [
+          {
+            id: 'm1',
+            timeSlot: '09:00 - 10:30',
+            subject: safeSubjects[0] || 'Core Subject',
+            topic: 'Theoretical Foundations & Complexity Review',
+            durationMinutes: 90,
+            completed: false,
+          },
+          {
+            id: 'm2',
+            timeSlot: '11:00 - 12:00',
+            subject: safeSubjects[1] || safeSubjects[0],
+            topic: 'Key Invariants & Practice Problems',
+            durationMinutes: 60,
+            completed: false,
+          },
+        ],
+      },
+      {
+        dayName: 'Tuesday',
+        theme: 'Algorithmic Drills & Step-by-Step Proofs',
+        sessions: [
+          {
+            id: 't1',
+            timeSlot: '09:30 - 11:00',
+            subject: safeSubjects[1] || safeSubjects[0],
+            topic: 'Analytical Problem Sets & Proofs',
+            durationMinutes: 90,
+            completed: false,
+          },
+          {
+            id: 't2',
+            timeSlot: '14:00 - 15:15',
+            subject: safeSubjects[0],
+            topic: 'Implementation & Trace Review',
+            durationMinutes: 75,
+            completed: false,
+          },
+        ],
+      },
+      {
+        dayName: 'Wednesday',
+        theme: 'Mid-Week Spaced Repetition & Quiz Checkpoint',
+        sessions: [
+          {
+            id: 'w1',
+            timeSlot: '10:00 - 11:30',
+            subject: safeSubjects[0],
+            topic: 'Active Recall & Self-Testing Questions',
+            durationMinutes: 90,
+            completed: false,
+          },
+          {
+            id: 'w2',
+            timeSlot: '15:00 - 16:15',
+            subject: safeSubjects[2] || safeSubjects[1] || safeSubjects[0],
+            topic: 'Flashcard Mastery Check',
+            durationMinutes: 75,
+            completed: false,
+          },
+        ],
+      },
+      {
+        dayName: 'Thursday',
+        theme: 'Edge Cases, Bug Tracing & Code Rigor',
+        sessions: [
+          {
+            id: 'th1',
+            timeSlot: '09:00 - 10:30',
+            subject: safeSubjects[0],
+            topic: 'Boundary Conditions & Edge Cases',
+            durationMinutes: 90,
+            completed: false,
+          },
+        ],
+      },
+      {
+        dayName: 'Friday',
+        theme: 'Synthesis & Summary Revision Sheets',
+        sessions: [
+          {
+            id: 'f1',
+            timeSlot: '10:00 - 11:30',
+            subject: 'Cross-Subject Synthesis',
+            topic: 'Creating 1-Page Exam Reference Sheets',
+            durationMinutes: 90,
+            completed: false,
+          },
+        ],
+      },
+      {
+        dayName: 'Saturday',
+        theme: 'Timed Exam Simulation',
+        sessions: [
+          {
+            id: 's1',
+            timeSlot: '10:00 - 12:00',
+            subject: 'Timed Assessment',
+            topic: 'Simulated Midterm / Final Exam Paper',
+            durationMinutes: 120,
+            completed: false,
+          },
+        ],
+      },
+      {
+        dayName: 'Sunday',
+        theme: 'Consolidation & Upcoming Week Prep',
+        sessions: [
+          {
+            id: 'su1',
+            timeSlot: '11:00 - 12:15',
+            subject: 'Weekly Review',
+            topic: 'Weak-Spot Remediation with AI Tutor',
+            durationMinutes: 75,
+            completed: false,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+// ==========================================
+// API ENDPOINTS
+// ==========================================
+
+// Health check endpoint
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    hasApiKey: Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey !== 'your_api_key_here'),
+    model: PRIMARY_MODEL,
+    fallbackModel: FALLBACK_MODEL,
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // 1. AI Tutor Streaming Endpoint (SSE)
 app.post('/api/tutor/chat/stream', async (req: Request, res: Response) => {
@@ -311,54 +671,100 @@ app.post('/api/tutor/chat/stream', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Question text is required.' });
   }
 
+  if (question.length > 2000) {
+    return res.status(400).json({ error: 'Question text exceeds maximum allowed length of 2,000 characters.' });
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
+  let isAborted = false;
+  req.on('close', () => {
+    isAborted = true;
+  });
+
+  // If no API key configured, stream fallback answer clearly labeled
   if (!aiClient) {
-    // If no API key configured, stream fallback answer smoothly
     const fallbackText = getFallbackTutorResponse(question.trim(), subject, studyMode);
     const words = fallbackText.split(' ');
     for (let i = 0; i < words.length; i += 3) {
+      if (isAborted || res.writableEnded || res.closed) break;
       const chunk = words.slice(i, i + 3).join(' ') + (i + 3 < words.length ? ' ' : '');
-      res.write(`data: ${JSON.stringify({ text: chunk, isDemo: true })}\n\n`);
-      await new Promise((r) => setTimeout(r, 25));
+      res.write(`data: ${JSON.stringify({ text: chunk, isDemo: true, notice: 'Offline demo response (API key not configured)' })}\n\n`);
+      await new Promise((r) => setTimeout(r, 20));
     }
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    return res.end();
+    if (!res.writableEnded && !res.closed) {
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    }
+    return;
   }
 
   try {
     const contents = buildGeminiContents(history, question.trim(), subject, studyMode);
+    const modelsToTry = [PRIMARY_MODEL, FALLBACK_MODEL];
+    let streamSuccess = false;
+    let streamStarted = false;
 
-    const streamResult = await aiClient.models.generateContentStream({
-      model: 'gemini-3.8-flash',
-      contents,
-      config: {
-        systemInstruction: STUDYPILOT_SYSTEM_INSTRUCTION,
-        temperature: 0.4,
-      },
-    });
+    for (const model of modelsToTry) {
+      if (streamSuccess || isAborted || res.writableEnded || res.closed) break;
+      try {
+        const streamResult = await aiClient.models.generateContentStream({
+          model,
+          contents,
+          config: {
+            systemInstruction: STUDYPILOT_SYSTEM_INSTRUCTION,
+            temperature: 0.4,
+          },
+        });
 
-    for await (const chunk of streamResult) {
-      if (chunk.text) {
-        res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        for await (const chunk of streamResult) {
+          if (isAborted || res.writableEnded || res.closed) {
+            break;
+          }
+          if (chunk.text) {
+            streamStarted = true;
+            res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+          }
+        }
+
+        streamSuccess = true;
+        break;
+      } catch (streamErr: any) {
+        console.warn(`Streaming attempt with ${model} failed:`, streamErr?.status || streamErr?.message);
+        if (!streamStarted) {
+          // No chunks sent yet, fall through to next model
+          continue;
+        }
+        break;
       }
     }
 
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
-  } catch (error: any) {
-    console.error('Tutor streaming error:', error);
-    const friendlyMessage =
-      error?.status === 429
-        ? 'AI rate limit reached. Please wait a moment before asking another question.'
-        : "StudyPilot couldn't reach the AI service. Please check your connection and try again.";
+    if (!streamSuccess && !streamStarted && !res.writableEnded && !res.closed) {
+      const friendlyMessage = 'AI service temporarily unavailable. Showing offline academic guidance.';
+      const fallbackText = getFallbackTutorResponse(question.trim(), subject, studyMode);
+      res.write(`data: ${JSON.stringify({ text: `\n\n> ⚠️ *${friendlyMessage}*\n\n` + fallbackText, isDemo: true, notice: friendlyMessage })}\n\n`);
+    }
 
-    res.write(`data: ${JSON.stringify({ error: friendlyMessage })}\n\n`);
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
+    if (!res.writableEnded && !res.closed) {
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    }
+  } catch (error: any) {
+    console.error('Tutor streaming outer error:', error);
+    if (!res.writableEnded && !res.closed) {
+      const friendlyMessage =
+        error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED')
+          ? 'AI rate limit reached. Showing offline academic guidance.'
+          : "StudyPilot encountered an AI service issue. Showing offline academic guidance.";
+
+      const fallbackText = getFallbackTutorResponse(question.trim(), subject, studyMode);
+      res.write(`data: ${JSON.stringify({ text: `\n\n> ⚠️ *${friendlyMessage}*\n\n` + fallbackText, isDemo: true, notice: friendlyMessage })}\n\n`);
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      res.end();
+    }
   }
 });
 
@@ -371,18 +777,22 @@ app.post('/api/tutor/chat', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Question text is required.' });
     }
 
+    if (question.length > 2000) {
+      return res.status(400).json({ error: 'Question text exceeds 2,000 character limit.' });
+    }
+
     if (!aiClient) {
       const fallbackText = getFallbackTutorResponse(question.trim(), subject, studyMode);
       return res.json({
         answer: fallbackText,
         isDemoFallback: true,
+        notice: 'Offline demo response: API key is not configured.',
       });
     }
 
     const contents = buildGeminiContents(history, question.trim(), subject, studyMode);
 
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
+    const { response, modelUsed } = await callGeminiWithRetry({
       contents,
       config: {
         systemInstruction: STUDYPILOT_SYSTEM_INSTRUCTION,
@@ -395,13 +805,14 @@ app.post('/api/tutor/chat', async (req: Request, res: Response) => {
     return res.json({
       answer,
       isDemoFallback: false,
+      modelUsed,
     });
   } catch (error: any) {
     console.error('Tutor chat error:', error);
     const friendlyMessage =
-      error?.status === 429
-        ? 'AI rate limit reached. Please wait a moment before trying again.'
-        : "StudyPilot couldn't reach the AI service. Please check your connection and try again.";
+      error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED')
+        ? 'AI rate limit reached. Showing curated offline study response.'
+        : "AI service temporarily unavailable. Showing curated offline study response.";
 
     const { question = '', subject = 'General', studyMode = 'standard' } = req.body;
     return res.json({
@@ -421,80 +832,35 @@ app.post('/api/notes/generate', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Study material text is required.' });
     }
 
+    if (material.length > 30000) {
+      return res.status(400).json({ error: 'Study material exceeds 30,000 character limit.' });
+    }
+
     if (!aiClient) {
-      // High quality syllabus fallback notes
-      const fallbackNotes = `# 📖 Comprehensive Study Notes: ${topic}
-*Subject: ${subject} · Generated by StudyPilot AI*
-
----
-
-## 🎯 Executive Summary
-This document synthesizes core academic principles regarding **${topic}**, outlining foundational definitions, architectural mechanics, critical theorems, and examination checkpoints.
-
----
-
-## 📌 Core Concepts & Terminology
-1. **Primary Definition:** Fundamental framework designed to streamline analysis, decouple dependencies, and maintain systemic consistency.
-2. **Key Invariant:** The operational premise that state transitions must preserve baseline integrity under all edge condition workloads.
-3. **Comparative Analysis:** Unlike naive implementations which suffer from scalability bottlenecks, this methodology enforces modularity and predictable performance bounds.
-
----
-
-## 💡 Detailed Structural Breakdown
-- **Phase 1: Input Identification & Preconditions**
-  - Verify boundary assertions and parameter domains.
-  - Eliminate redundant dependencies prior to execution.
-- **Phase 2: Systematic Transformation**
-  - Execute normalized transitions following textbook protocols.
-  - Maintain checkpoints for error detection and rollback safety.
-- **Phase 3: Verification & Invariant Proofs**
-  - Measure empirical overhead versus theoretical complexity metrics.
-
----
-
-## 🚀 Quick Revision Checklist & Exam Tips
-- [ ] Understand the 3 primary trade-offs: Memory, Latency, and Implementation Complexity.
-- [ ] Memorize the standard formal definition for 2-mark examination questions.
-- [ ] Practice drawing the architectural schematic with labeled arrows.
-- [ ] Review common edge cases involving null boundaries or concurrency hazards.`;
-
       return res.json({
-        notes: fallbackNotes,
+        notes: getFallbackNotes(topic, subject, actionType, material),
         isDemoFallback: true,
+        notice: 'Offline demo notes: API key not configured.',
       });
     }
 
-    let actionPrompt = '';
-    switch (actionType) {
-      case 'summarize':
-        actionPrompt = 'Create a dense, high-retention summary with an executive overview, 3-5 core takeaways, and a bulleted synthesis of key concepts.';
-        break;
-      case 'keypoints':
-        actionPrompt = 'Extract all critical key points, essential formulas/theorems, vital definitions, and high-yield examination facts.';
-        break;
-      case 'revisionsheet':
-        actionPrompt = 'Create a high-impact 1-page "Cheat Sheet / Revision Guide" optimized for quick reading 30 minutes before a final college exam.';
-        break;
-      case 'notes':
-      default:
-        actionPrompt = 'Generate a comprehensive, beautifully structured college study notes document with Markdown headings, definition callouts, detailed section explanations, diagrams/code where helpful, and revision checklists.';
-        break;
-    }
-
-    const prompt = `ACADEMIC CONTEXT:
+    const prompt = `You are generating academic study notes for university students.
+Action Requested: ${actionType}
 Subject: ${subject}
 Topic: ${topic}
-Task Goal: ${actionPrompt}
 
-Source Content:
+Source Material:
 """
-${material.slice(0, 15000)}
+${material.slice(0, 25000)}
 """
 
-Please produce professional, clean academic notes using crisp Markdown formatting following the instructions above.`;
+Please produce comprehensive, accurate, Markdown-formatted study output according to action:
+- 'summarize': Concise executive summary + core points.
+- 'notes': Structured textbook notes with conceptual overview, definitions, step-by-step breakdown, and exam tips.
+- 'keypoints': High-yield bullet points with bold key terms.
+- 'revisionsheet': 1-page high-retention exam cheat sheet with key formulas, invariants, and pitfalls.`;
 
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
+    const { response, modelUsed } = await callGeminiWithRetry({
       contents: prompt,
       config: {
         systemInstruction: STUDYPILOT_SYSTEM_INSTRUCTION,
@@ -505,16 +871,25 @@ Please produce professional, clean academic notes using crisp Markdown formattin
     return res.json({
       notes: response.text,
       isDemoFallback: false,
+      modelUsed,
     });
   } catch (error: any) {
     console.error('Notes generator error:', error);
-    return res.status(500).json({
-      error: "StudyPilot couldn't reach the AI service. Please check your connection and try again.",
+    const friendlyMessage =
+      error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED')
+        ? 'AI rate limit reached. Showing offline summary template.'
+        : "AI service temporarily unavailable. Showing offline summary template.";
+
+    const { topic = 'Key Concepts', subject = 'General', actionType = 'notes', material = '' } = req.body;
+    return res.json({
+      notes: getFallbackNotes(topic, subject, actionType, material),
+      isDemoFallback: true,
+      errorNotice: friendlyMessage,
     });
   }
 });
 
-// 4. Quiz Generator Endpoint with Strict JSON Schema
+// 4. Quiz Generator Endpoint with Strict JSON Schema & Answer Validation
 app.post('/api/quiz/generate', async (req: Request, res: Response) => {
   try {
     const {
@@ -528,69 +903,11 @@ app.post('/api/quiz/generate', async (req: Request, res: Response) => {
     const requestedCount = Math.min(Math.max(Number(count) || 5, 3), 20);
 
     if (!aiClient) {
-      // Curated demo questions
-      const demoQuestions = [
-        {
-          id: 1,
-          question: `In ${subject} (${topic}), what is the primary computational benefit of applying normalization or balanced partitioning?`,
-          options: [
-            'Reduces redundancy and minimizes anomalies in state transitions',
-            'Completely eliminates the need for indexing structures',
-            'Forces all operations into O(1) constant time regardless of scale',
-            'Bypasses hardware memory constraints entirely',
-          ],
-          correctAnswer: 0,
-          explanation:
-            'Balanced partitioning and normalization systematically eliminate redundant records, preventing update anomalies and reducing storage overhead.',
-        },
-        {
-          id: 2,
-          question: `Which asymptotic complexity class represents the optimal comparison-based sorting bound in average and worst cases?`,
-          options: ['O(N)', 'O(N log N)', 'O(N²)', 'O(log N)'],
-          correctAnswer: 1,
-          explanation:
-            'By decision-tree lower bound analysis, any comparison-based sort requires at least Ω(N log N) comparisons in the worst/average case.',
-        },
-        {
-          id: 3,
-          question: `True or False: In relational database design, BCNF (Boyce-Codd Normal Form) is strictly stricter than 3NF (Third Normal Form).`,
-          options: ['True', 'False'],
-          correctAnswer: 0,
-          explanation:
-            'True. BCNF requires that for every functional dependency X -> Y, X must be a superkey, whereas 3NF allows Y to be a prime attribute.',
-        },
-        {
-          id: 4,
-          question: `When designing concurrent systems, what does the ACID property "Isolation" guarantee?`,
-          options: [
-            'Data is instantly written to cold magnetic storage',
-            'Concurrent transactions execute as if occurring sequentially without interleaving hazards',
-            'Network sockets are encrypted with asymmetric keys',
-            'Transactions are automatically rolled back every 60 seconds',
-          ],
-          correctAnswer: 1,
-          explanation:
-            'Isolation ensures intermediate transaction states remain invisible to other concurrent operations, preventing dirty reads and lost updates.',
-        },
-        {
-          id: 5,
-          question: `In memory management, what phenomenon occurs when free storage is split into small non-contiguous blocks that cannot accommodate a large allocation?`,
-          options: [
-            'External Fragmentation',
-            'Thrashing',
-            'Deadlock Cascade',
-            'Cache Line Invalidation',
-          ],
-          correctAnswer: 0,
-          explanation:
-            'External fragmentation occurs when total free memory is sufficient to satisfy a request, but the memory is non-contiguous, preventing allocation.',
-        },
-      ].slice(0, requestedCount);
-
       return res.json({
         title: `${topic} Quiz (${difficulty})`,
-        questions: demoQuestions,
+        questions: getFallbackQuiz(subject, topic, difficulty, requestedCount),
         isDemoFallback: true,
+        notice: 'Offline demo questions: API key not configured.',
       });
     }
 
@@ -598,14 +915,19 @@ app.post('/api/quiz/generate', async (req: Request, res: Response) => {
 Subject: ${subject}
 Topic: ${topic}
 Difficulty: ${difficulty}
-Question Type: ${questionType} (Each question must have options, a correct answer matching one of the options, and an educational explanation).`;
+Question Type: ${questionType}
 
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
+Each question must have:
+- 'question': Clear, educational question prompt
+- 'options': Array of 4 answer options (or 2 for True/False)
+- 'correctAnswer': The exact text string matching the correct option
+- 'explanation': Academic rationale explaining why the correct choice is right`;
+
+    const { response, modelUsed } = await callGeminiWithRetry({
       contents: prompt,
       config: {
         systemInstruction: `${STUDYPILOT_SYSTEM_INSTRUCTION}
-Generate accurate, high-quality exam questions with one unequivocally correct answer and three plausible college-level distractors (or 2 options for True/False). Provide a thorough, pedagogical explanation for why the correct option is right.`,
+Generate accurate, high-quality exam questions with one unequivocally correct answer and three plausible college-level distractors (or 2 for True/False).`,
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -643,31 +965,65 @@ Generate accurate, high-quality exam questions with one unequivocally correct an
 
     const parsed = JSON.parse(response.text || '{}');
 
-    // Validate and normalize questions
     if (!parsed.questions || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
-      throw new Error('Malformed quiz schema returned');
+      throw new Error('Malformed quiz schema returned by AI service.');
     }
 
+    // Robust validation and index resolution (NEVER blindly default to index 0)
     const validatedQuestions = parsed.questions.map((q: any, index: number) => {
-      const options = Array.isArray(q.options) && q.options.length >= 2 ? q.options : ['Option A', 'Option B'];
-      
-      // Determine correct answer index
-      let correctIndex = 0;
-      if (typeof q.correctAnswer === 'string') {
-        const found = options.findIndex(
-          (opt: string) => opt.trim().toLowerCase() === q.correctAnswer.trim().toLowerCase()
-        );
-        correctIndex = found >= 0 ? found : 0;
-      } else if (typeof q.correctAnswer === 'number') {
-        correctIndex = Math.max(0, Math.min(q.correctAnswer, options.length - 1));
+      let options: string[] = Array.isArray(q.options)
+        ? q.options.map((opt: any) => String(opt || '').trim()).filter(Boolean)
+        : [];
+
+      if (options.length < 2) {
+        options = ['Option A', 'Option B', 'Option C', 'Option D'];
+      }
+
+      let correctIndex = -1;
+      const ans = q.correctAnswer;
+
+      if (typeof ans === 'number' && Number.isInteger(ans) && ans >= 0 && ans < options.length) {
+        correctIndex = ans;
+      } else if (typeof ans === 'string') {
+        const trimmed = ans.trim();
+        // 1. Exact match (case-insensitive)
+        const exactIdx = options.findIndex((opt) => opt.toLowerCase() === trimmed.toLowerCase());
+        if (exactIdx >= 0) {
+          correctIndex = exactIdx;
+        } else {
+          // 2. Letter match: "A" -> 0, "B" -> 1, "C" -> 2, "D" -> 3
+          const letterMatch = trimmed.match(/^[A-Da-d]\b/);
+          if (letterMatch) {
+            const idx = letterMatch[0].toUpperCase().charCodeAt(0) - 65;
+            if (idx >= 0 && idx < options.length) {
+              correctIndex = idx;
+            }
+          } else {
+            // 3. Numeric string match: "0", "1", "2"
+            const num = parseInt(trimmed, 10);
+            if (!isNaN(num) && num >= 0 && num < options.length) {
+              correctIndex = num;
+            }
+          }
+        }
+      }
+
+      // If answer string does not match any existing option, append it as a valid option
+      if (correctIndex === -1) {
+        if (typeof ans === 'string' && ans.trim()) {
+          options.push(ans.trim());
+          correctIndex = options.length - 1;
+        } else {
+          correctIndex = 0;
+        }
       }
 
       return {
         id: index + 1,
-        question: q.question || `Question ${index + 1}`,
+        question: String(q.question || `Question ${index + 1}`).trim(),
         options,
         correctAnswer: correctIndex,
-        explanation: q.explanation || 'Review course textbook for full derivation.',
+        explanation: String(q.explanation || 'Refer to course materials for complete details.').trim(),
       };
     });
 
@@ -675,85 +1031,49 @@ Generate accurate, high-quality exam questions with one unequivocally correct an
       title: parsed.title || `${topic} Quiz`,
       questions: validatedQuestions,
       isDemoFallback: false,
+      modelUsed,
     });
   } catch (error: any) {
     console.error('Quiz generator error:', error);
-    return res.status(500).json({
-      error: "StudyPilot couldn't reach the AI service. Please check your connection and try again.",
+    const friendlyMessage =
+      error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED')
+        ? 'AI rate limit reached. Showing curated offline quiz questions.'
+        : "AI service temporarily unavailable. Showing curated offline quiz questions.";
+
+    const { subject = 'Computer Science', topic = 'Data Structures', difficulty = 'Medium', count = 5 } = req.body;
+    return res.json({
+      title: `${topic} Quiz (${difficulty})`,
+      questions: getFallbackQuiz(subject, topic, difficulty, Number(count) || 5),
+      isDemoFallback: true,
+      errorNotice: friendlyMessage,
     });
   }
 });
 
-// 5. Flashcards Generator Endpoint with Strict JSON Schema
+// 5. Flashcards Generator Endpoint
 app.post('/api/flashcards/generate', async (req: Request, res: Response) => {
   try {
     const { subject = 'General', topic = 'Key Concepts', material = '', count = 8 } = req.body;
-
     const requestedCount = Math.min(Math.max(Number(count) || 8, 4), 20);
 
     if (!aiClient) {
-      const demoFlashcards = [
-        {
-          id: 1,
-          front: 'What is the Time Complexity of searching in an AVL Tree or Red-Black Tree in the worst case?',
-          back: 'O(log N). Strict height-balancing rotations bound tree height to O(log N).',
-          hint: 'Think about logarithmic height invariants.',
-          tag: 'Data Structures',
-        },
-        {
-          id: 2,
-          front: 'Define "Idempotence" in API and system design.',
-          back: 'An operation is idempotent if executing it multiple times produces the exact same side-effects as executing it once (e.g. HTTP PUT or DELETE).',
-          hint: 'f(f(x)) = f(x)',
-          tag: 'Systems Architecture',
-        },
-        {
-          id: 3,
-          front: 'What are the four Coffman conditions required for a Deadlock to occur?',
-          back: '1. Mutual Exclusion\n2. Hold and Wait\n3. No Preemption\n4. Circular Wait',
-          hint: 'Breaking any single one prevents deadlock.',
-          tag: 'Operating Systems',
-        },
-        {
-          id: 4,
-          front: 'What distinguishes a Primary Key from a Candidate Key in Relational Databases?',
-          back: 'A Candidate Key is any minimal superkey that uniquely identifies tuples. The database designer chooses exactly one candidate key to serve as the Primary Key.',
-          hint: 'Uniqueness + minimality',
-          tag: 'DBMS',
-        },
-        {
-          id: 5,
-          front: 'What is the purpose of the Central Limit Theorem (CLT) in Statistics?',
-          back: 'The sampling distribution of the sample mean approaches a Normal Distribution as sample size increases (typically n >= 30), regardless of the shape of the underlying population.',
-          hint: 'Gaussian convergence for large sample means',
-          tag: 'Mathematics',
-        },
-        {
-          id: 6,
-          front: 'Explain the difference between P and NP complexity classes.',
-          back: 'P contains decision problems solvable in polynomial time by a deterministic Turing machine. NP contains decision problems whose solutions can be verified in polynomial time.',
-          hint: 'Solving vs. Verifying',
-          tag: 'Theory of Computation',
-        },
-      ].slice(0, requestedCount);
-
       return res.json({
-        flashcards: demoFlashcards,
+        flashcards: getFallbackFlashcards(subject, topic, requestedCount),
         isDemoFallback: true,
+        notice: 'Offline demo flashcards: API key not configured.',
       });
     }
 
     const prompt = `Generate exactly ${requestedCount} high-yield, interactive flashcards for university students.
 Subject: ${subject}
 Topic: ${topic}
-${material ? `Based on this study material: """${material.slice(0, 10000)}"""` : 'Cover the most critical definitions, theorems, questions, and core concepts.'}`;
+${material ? `Based on this study material:\n"""${material.slice(0, 15000)}"""` : 'Cover the most critical definitions, theorems, questions, and core concepts.'}`;
 
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
+    const { response, modelUsed } = await callGeminiWithRetry({
       contents: prompt,
       config: {
         systemInstruction: `${STUDYPILOT_SYSTEM_INSTRUCTION}
-Create concise, memorable flashcards with a clear front question/prompt and a definitive, thorough answer.`,
+Create concise, memorable flashcards with a clear front question and a definitive, thorough back answer.`,
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -763,8 +1083,8 @@ Create concise, memorable flashcards with a clear front question/prompt and a de
               items: {
                 type: Type.OBJECT,
                 properties: {
-                  question: { type: Type.STRING, description: 'Question or concept on the front of the card' },
-                  answer: { type: Type.STRING, description: 'Clear, accurate answer on the back' },
+                  question: { type: Type.STRING, description: 'Question or concept on front of card' },
+                  answer: { type: Type.STRING, description: 'Clear, accurate answer on back' },
                 },
                 required: ['question', 'answer'],
               },
@@ -778,13 +1098,13 @@ Create concise, memorable flashcards with a clear front question/prompt and a de
 
     const parsed = JSON.parse(response.text || '{}');
     if (!parsed.cards || !Array.isArray(parsed.cards)) {
-      throw new Error('Malformed flashcards schema');
+      throw new Error('Malformed flashcards schema returned');
     }
 
     const validatedFlashcards = parsed.cards.map((c: any, i: number) => ({
       id: i + 1,
-      front: c.question || `Card Question ${i + 1}`,
-      back: c.answer || 'Review course materials for complete details.',
+      front: String(c.question || `Card Question ${i + 1}`).trim(),
+      back: String(c.answer || 'Review course materials for complete details.').trim(),
       hint: `${subject} Core Concept`,
       tag: subject,
     }));
@@ -792,11 +1112,20 @@ Create concise, memorable flashcards with a clear front question/prompt and a de
     return res.json({
       flashcards: validatedFlashcards,
       isDemoFallback: false,
+      modelUsed,
     });
   } catch (error: any) {
     console.error('Flashcard generator error:', error);
-    return res.status(500).json({
-      error: "StudyPilot couldn't reach the AI service. Please check your connection and try again.",
+    const friendlyMessage =
+      error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED')
+        ? 'AI rate limit reached. Showing curated offline flashcard deck.'
+        : "AI service temporarily unavailable. Showing curated offline flashcard deck.";
+
+    const { subject = 'General', topic = 'Key Concepts', count = 8 } = req.body;
+    return res.json({
+      flashcards: getFallbackFlashcards(subject, topic, Number(count) || 8),
+      isDemoFallback: true,
+      errorNotice: friendlyMessage,
     });
   }
 });
@@ -812,185 +1141,27 @@ app.post('/api/planner/generate', async (req: Request, res: Response) => {
       preferredTime = 'Evening',
     } = req.body;
 
-    if (!aiClient) {
-      const demoPlan = {
-        title: `Comprehensive Weekly Study Plan (${availableHours} hrs/day)`,
-        overview: `Engineered for balanced retention across ${subjects.join(', ')} with scheduled active recall and spaced repetition sessions before ${examDate}.`,
-        days: [
-          {
-            dayName: 'Monday',
-            theme: 'Foundations & High-Yield Core Concepts',
-            sessions: [
-              {
-                id: 'm1',
-                timeSlot: '09:00 - 10:15',
-                subject: subjects[0] || 'Core Subject',
-                topic: 'Theoretical Foundations & Complexity Review',
-                durationMinutes: 75,
-                completed: false,
-              },
-              {
-                id: 'm2',
-                timeSlot: '10:30 - 11:30',
-                subject: subjects[1] || 'Second Subject',
-                topic: 'Key Invariants & Practice Problems',
-                durationMinutes: 60,
-                completed: false,
-              },
-              {
-                id: 'm3',
-                timeSlot: '17:00 - 18:00',
-                subject: subjects[2] || subjects[0],
-                topic: 'Active Recall & Flashcard Self-Testing',
-                durationMinutes: 60,
-                completed: false,
-              },
-            ],
-          },
-          {
-            dayName: 'Tuesday',
-            theme: 'Deep Practice & Algorithmic Problem Solving',
-            sessions: [
-              {
-                id: 't1',
-                timeSlot: '09:00 - 10:30',
-                subject: subjects[1] || 'Core Subject',
-                topic: 'Relational Schemas & Normalization Proofs',
-                durationMinutes: 90,
-                completed: false,
-              },
-              {
-                id: 't2',
-                timeSlot: '14:00 - 15:15',
-                subject: subjects[0] || 'Core Subject',
-                topic: 'Tree Traversal & Heap Implementation',
-                durationMinutes: 75,
-                completed: false,
-              },
-            ],
-          },
-          {
-            dayName: 'Wednesday',
-            theme: 'Mid-Week Spaced Repetition & Quiz Checkpoint',
-            sessions: [
-              {
-                id: 'w1',
-                timeSlot: '10:00 - 11:30',
-                subject: subjects[2] || subjects[0],
-                topic: 'Matrix Transformations & Proof Verification',
-                durationMinutes: 90,
-                completed: false,
-              },
-              {
-                id: 'w2',
-                timeSlot: '16:00 - 17:30',
-                subject: 'Mock Quiz / Self-Assessment',
-                topic: 'Timed 20-Question Exam Simulation',
-                durationMinutes: 90,
-                completed: false,
-              },
-            ],
-          },
-          {
-            dayName: 'Thursday',
-            theme: 'Edge Cases, Bug Tracing & Proof Rigor',
-            sessions: [
-              {
-                id: 'th1',
-                timeSlot: '09:00 - 10:30',
-                subject: subjects[0] || 'Core Subject',
-                topic: 'Graph Algorithms: Dijkstra, Bellman-Ford & BFS/DFS',
-                durationMinutes: 90,
-                completed: false,
-              },
-              {
-                id: 'th2',
-                timeSlot: '15:00 - 16:30',
-                subject: subjects[1] || 'Second Subject',
-                topic: 'ACID Transactions, Locking & Deadlock Avoidance',
-                durationMinutes: 90,
-                completed: false,
-              },
-            ],
-          },
-          {
-            dayName: 'Friday',
-            theme: 'Synthesis & Summary Revision Sheets',
-            sessions: [
-              {
-                id: 'f1',
-                timeSlot: '10:00 - 11:30',
-                subject: 'Cross-Subject Synthesis',
-                topic: 'Creating 1-Page Exam Cheat Sheets',
-                durationMinutes: 90,
-                completed: false,
-              },
-              {
-                id: 'f2',
-                timeSlot: '14:00 - 15:00',
-                subject: subjects[2] || subjects[0],
-                topic: 'Eigenvalues & Diagonalization Practice',
-                durationMinutes: 60,
-                completed: false,
-              },
-            ],
-          },
-          {
-            dayName: 'Saturday',
-            theme: 'Past Exam Papers & Timed Simulation',
-            sessions: [
-              {
-                id: 's1',
-                timeSlot: '10:00 - 12:00',
-                subject: 'Comprehensive Simulation',
-                topic: 'Previous Year Midterm / Final Exam Paper',
-                durationMinutes: 120,
-                completed: false,
-              },
-              {
-                id: 's2',
-                timeSlot: '14:30 - 16:00',
-                subject: 'Weak-Spot Remediation',
-                topic: 'Reviewing Incorrect Quiz Questions with AI Tutor',
-                durationMinutes: 90,
-                completed: false,
-              },
-            ],
-          },
-          {
-            dayName: 'Sunday',
-            theme: 'Light Consolidation & Upcoming Week Prep',
-            sessions: [
-              {
-                id: 'su1',
-                timeSlot: '11:00 - 12:15',
-                subject: 'Weekly Review',
-                topic: 'Flashcard Mastery Check & Knowledge Mapping',
-                durationMinutes: 75,
-                completed: false,
-              },
-            ],
-          },
-        ],
-      };
+    const safeHours = Math.min(Math.max(Number(availableHours) || 4, 1), 16);
+    const safeSubjects = Array.isArray(subjects) ? subjects : [String(subjects || 'General Studies')];
 
+    if (!aiClient) {
       return res.json({
-        plan: demoPlan,
+        plan: getFallbackStudyPlan(safeSubjects, safeHours, examDate),
         isDemoFallback: true,
+        notice: 'Offline demo study plan: API key not configured.',
       });
     }
 
     const prompt = `Create a realistic, pedagogically balanced 7-day college study schedule.
-Subjects: ${Array.isArray(subjects) ? subjects.join(', ') : subjects}
-Available Hours Per Day: ${availableHours} hours
+Subjects: ${safeSubjects.join(', ')}
+Available Hours Per Day: ${safeHours} hours
 Exam Date: ${examDate}
 Difficulty Allocation: ${JSON.stringify(difficultyMap)}
-Preferred Study Time: ${preferredTime} (Structure time blocks around this window)
+Preferred Study Time: ${preferredTime}
 
 Include spaced repetition, active recall sessions, and timed assessment blocks.`;
 
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
+    const { response, modelUsed } = await callGeminiWithRetry({
       contents: prompt,
       config: {
         systemInstruction: `${STUDYPILOT_SYSTEM_INSTRUCTION}
@@ -1038,11 +1209,20 @@ Generate an actionable, high-retention weekly study schedule with realistic brea
     return res.json({
       plan: parsed,
       isDemoFallback: false,
+      modelUsed,
     });
   } catch (error: any) {
     console.error('Planner generator error:', error);
-    return res.status(500).json({
-      error: "StudyPilot couldn't reach the AI service. Please check your connection and try again.",
+    const friendlyMessage =
+      error?.status === 429 || error?.message?.includes('RESOURCE_EXHAUSTED')
+        ? 'AI rate limit reached. Showing curated weekly study template.'
+        : "AI service temporarily unavailable. Showing curated weekly study template.";
+
+    const { subjects = ['Data Structures', 'DBMS'], availableHours = 4, examDate = 'In 2 weeks' } = req.body;
+    return res.json({
+      plan: getFallbackStudyPlan(subjects, Number(availableHours) || 4, examDate),
+      isDemoFallback: true,
+      errorNotice: friendlyMessage,
     });
   }
 });
@@ -1057,16 +1237,36 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(__dirname, 'dist');
+    const distPath = fs.existsSync(path.resolve(__dirname, 'index.html'))
+      ? __dirname
+      : path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }
 
-  app.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`StudyPilot AI server running at http://0.0.0.0:${PORT}`);
+  const server = app.listen(Number(PORT), '0.0.0.0', () => {
+    console.log(`StudyPilot AI server running at http://0.0.0.0:${PORT} [${process.env.NODE_ENV || 'development'}]`);
   });
+
+  // Graceful shutdown handling
+  const shutdown = () => {
+    console.log('Shutting down StudyPilot server gracefully...');
+    server.close(() => {
+      console.log('HTTP server closed successfully.');
+      process.exit(0);
+    });
+
+    // Force exit after 3 seconds if connections linger
+    setTimeout(() => {
+      console.error('Forcing server shutdown.');
+      process.exit(1);
+    }, 3000).unref();
+  };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 startServer();

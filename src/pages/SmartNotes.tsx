@@ -4,6 +4,7 @@ import { geminiService } from '../services/gemini';
 import { storage } from '../services/storage';
 import { SubjectCategory, GeneratedNote, ALL_SUBJECTS } from '../types';
 import { MarkdownRenderer } from '../components/MarkdownRenderer';
+import { Modal } from '../components/Modal';
 import {
   FileText,
   Upload,
@@ -50,6 +51,7 @@ export const SmartNotes: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedNote, setGeneratedNote] = useState<GeneratedNote | null>(null);
   const [copied, setCopied] = useState(false);
+  const [isClearModalOpen, setIsClearModalOpen] = useState(false);
 
   const handleGenerate = async (selectedAction: 'summarize' | 'notes' | 'keypoints' | 'revisionsheet') => {
     if (!material.trim()) {
@@ -148,11 +150,14 @@ export const SmartNotes: React.FC = () => {
   };
 
   const handleClear = () => {
-    if (window.confirm('Clear the current workspace?')) {
-      setMaterial('');
-      setTopic('');
-      setGeneratedNote(null);
-    }
+    setIsClearModalOpen(true);
+  };
+
+  const confirmClearWorkspace = () => {
+    setIsClearModalOpen(false);
+    setMaterial('');
+    setTopic('');
+    setGeneratedNote(null);
   };
 
   const subjects = ALL_SUBJECTS;
@@ -400,6 +405,35 @@ export const SmartNotes: React.FC = () => {
           </div>
         </div>
       </div>
+
+      <Modal
+        isOpen={isClearModalOpen}
+        onClose={() => setIsClearModalOpen(false)}
+        title="Clear Workspace"
+        maxWidth="sm"
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setIsClearModalOpen(false)}
+              className="px-4 py-2 rounded-xl text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={confirmClearWorkspace}
+              className="px-4 py-2 rounded-xl text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 transition-colors cursor-pointer"
+            >
+              Clear Workspace
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          Are you sure you want to clear your current workspace? This will reset the study material input and any unsaved generated notes.
+        </p>
+      </Modal>
     </div>
   );
 };

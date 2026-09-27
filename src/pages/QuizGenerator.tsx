@@ -3,6 +3,7 @@ import { useApp } from '../context/AppContext';
 import { geminiService } from '../services/gemini';
 import { storage } from '../services/storage';
 import { QuizQuestion, QuizAttempt, SubjectCategory, ALL_SUBJECTS } from '../types';
+import { Modal } from '../components/Modal';
 import {
   HelpCircle,
   Sparkles,
@@ -33,6 +34,7 @@ export const QuizGenerator: React.FC = () => {
   const [userAnswers, setUserAnswers] = useState<Record<number, number>>({});
   const [quizCompleted, setQuizCompleted] = useState(false);
   const [attemptSummary, setAttemptSummary] = useState<QuizAttempt | null>(null);
+  const [isSubmitModalOpen, setIsSubmitModalOpen] = useState(false);
 
   const subjects = ALL_SUBJECTS;
 
@@ -84,20 +86,9 @@ export const QuizGenerator: React.FC = () => {
     }
   };
 
-  const handleSubmitQuiz = () => {
+  const finalizeSubmission = () => {
     if (!quizQuestions) return;
-
-    // Check if unanswered questions exist
-    const answeredCount = Object.keys(userAnswers).length;
-    if (answeredCount < quizQuestions.length) {
-      if (
-        !window.confirm(
-          `You have answered ${answeredCount} of ${quizQuestions.length} questions. Are you sure you want to submit?`
-        )
-      ) {
-        return;
-      }
-    }
+    setIsSubmitModalOpen(false);
 
     // Calculate score
     let score = 0;
@@ -137,12 +128,25 @@ export const QuizGenerator: React.FC = () => {
     storage.addHistoryItem({
       id: `hist-quiz-${Date.now()}`,
       type: 'quiz',
-      title: `${topic} Quiz (${difficulty})`,
-      subtitle: `Score: ${percentage}% (${score}/${total}) · ${subject}`,
+      title: `${topic} Quiz`,
+      subtitle: `${subject} · Score: ${score}/${total} (${percentage}%)`,
       timestamp: 'Just now',
     });
 
-    addToast('Quiz Completed', `Your score: ${percentage}% (${score}/${total})`, 'success');
+    addToast('Quiz Completed', `You scored ${score} out of ${total} (${percentage}%)!`, 'success');
+  };
+
+  const handleSubmitQuiz = () => {
+    if (!quizQuestions) return;
+
+    // Check if unanswered questions exist
+    const answeredCount = Object.keys(userAnswers).length;
+    if (answeredCount < quizQuestions.length) {
+      setIsSubmitModalOpen(true);
+      return;
+    }
+
+    finalizeSubmission();
   };
 
   const handleTryAgain = () => {
@@ -564,6 +568,36 @@ export const QuizGenerator: React.FC = () => {
           </button>
         </div>
       </div>
+
+      <Modal
+        isOpen={isSubmitModalOpen}
+        onClose={() => setIsSubmitModalOpen(false)}
+        title="Submit Incomplete Quiz?"
+        maxWidth="sm"
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setIsSubmitModalOpen(false)}
+              className="px-4 py-2 rounded-xl text-sm font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+            >
+              Keep Answering
+            </button>
+            <button
+              type="button"
+              onClick={finalizeSubmission}
+              className="px-4 py-2 rounded-xl text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 transition-colors cursor-pointer"
+            >
+              Submit Anyway
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          You have answered <strong>{Object.keys(userAnswers).length}</strong> of{' '}
+          <strong>{quizQuestions?.length || 0}</strong> questions. Unanswered questions will be scored as incorrect. Are you sure you want to finish now?
+        </p>
+      </Modal>
     </div>
   );
 };
