@@ -1,0 +1,6 @@
+{
+  "name": "StudyPilot AI",
+  "description": "AI-powered academic learning companion for college students to master concepts, create smart notes, generate interactive quizzes, study flashcards, and organize personalized study schedules.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
